@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs
+outputs/*
+!outputs/.gitignore
+
+# Models
+checkpoints/*
+!checkpoints/.gitignore
+
+# Data
+data/*
+!data/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
