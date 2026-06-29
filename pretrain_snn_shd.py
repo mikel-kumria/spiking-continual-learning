@@ -473,6 +473,29 @@ def _zero_removed_column(model, removed_class: int) -> None:
         model.W_out[:, removed_class] = 0.0
 
 
+@torch.no_grad()
+def output_firing_sanity(model, x_batch, low, high, max_iters=25):
+    """Scale W_out so the INITIAL mean output-spike rate lands in [low, high].
+
+    Analogue of the reservoir spectral-radius sanity, but for the spiking output
+    layer: at bptt init W_out is tiny so the output neurons are silent and the
+    surrogate gradient through them vanishes. We rescale W_out (uniformly) until
+    the output fires in a trainable range. Returns diagnostics.
+    """
+    scale = 1.0
+    rate = float(model.output_rates(x_batch).mean().item())
+    for _ in range(max_iters):
+        if rate > high:
+            model.W_out.mul_(0.8); scale *= 0.8
+        elif rate < low:
+            model.W_out.mul_(1.25); scale *= 1.25
+        else:
+            break
+        rate = float(model.output_rates(x_batch).mean().item())
+    return {"w_out_scale": scale, "output_firing_rate": rate,
+            "output_firing_in_window": bool(low <= rate <= high)}
+
+
 def train_ridge_active(model, X_tr, y_tr, active_classes, removed_class,
                        ridge_lambda, batch_size, device) -> None:
     """Closed-form (float64) ridge solve of W_out on ACTIVE-class targets only."""
@@ -520,6 +543,7 @@ def train_bptt_active(model, X_tr, y_tr, X_va, y_va, active_classes, removed_cla
 
     gen = torch.Generator().manual_seed(args.seed)
     N = X_tr.shape[0]
+    nb_steps = X_tr.shape[1]
     best = {"val_acc": -1.0, "epoch": -1, "state": None}
     for epoch in range(args.nb_epochs):
         model.train()
@@ -531,7 +555,11 @@ def train_bptt_active(model, X_tr, y_tr, X_va, y_va, active_classes, removed_cla
             xb = X_tr[idx].to(device)
             yb = y_tr[idx].to(device)
             yk = pos[yb]                                    # remapped [0,18]
-            logits = model(xb).index_select(1, active_idx)  # mask to active
+            # Train THROUGH the spiking output: CE on the output spike COUNT
+            # (mean rate * nb_steps) so logits are well-scaled and the surrogate
+            # gradient accumulates over time. Mask to the 19 active classes.
+            counts = model(xb) * nb_steps                   # [B, nb_outputs]
+            logits = counts.index_select(1, active_idx)     # [B, 19]
             loss = loss_fn(logits, yk)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -598,18 +626,36 @@ def main() -> int:
     # ---- neuron decays from the dataset binning dt ----
     dt_ms = float(args.dataset_binning_ms)
     alpha, beta = C.derive_alpha_beta(dt_ms, args.tau_mem_ms, args.tau_syn_ms)
-    print(f"dt_ms={dt_ms} alpha={alpha:.4f} beta={beta:.4f}")
+    # The SPIKING output neurons use long time constants so their mean-spike rate
+    # integrates over the trial and tracks the time-averaged drive (the same
+    # signal ridge/RLS optimise); short hidden decays would leak too fast.
+    out_alpha, out_beta = C.derive_alpha_beta(dt_ms, args.output_tau_mem_ms,
+                                              args.output_tau_syn_ms)
+    print(f"dt_ms={dt_ms} hidden alpha={alpha:.4f} beta={beta:.4f} | "
+          f"output alpha={out_alpha:.4f} beta={out_beta:.4f} thr={args.output_threshold}")
 
     # ---- model + spectral-radius sanity (reuse train_snn_shd's exact logic) ----
-    model = C.ReservoirSNN(nb_inputs, args.nb_hidden, args.nb_outputs, alpha, beta,
-                           args.threshold, args.weight_scale, args.surrogate_slope).to(device)
+    model = C.SpikingReadoutReservoirSNN(
+        nb_inputs, args.nb_hidden, args.nb_outputs, alpha, beta, args.threshold,
+        args.weight_scale, args.surrogate_slope, output_gain=args.output_gain,
+        output_threshold=args.output_threshold, output_alpha=out_alpha,
+        output_beta=out_beta).to(device)
     sr_ns = SimpleNamespace(
         init_spectral_radius=args.init_spectral_radius, firing_low=args.firing_low,
         firing_high=args.firing_high, sr_scale_up=1.2, sr_scale_down=0.8, sr_max_iters=20)
     sane_n = min(args.batch_size, X_tr.shape[0])
     sr_info = T.spectral_radius_sanity(model, X_tr[:sane_n].to(device), sr_ns)
     print(f"[sanity] spectral_radius -> {sr_info['final_spectral_radius']:.4f}  "
-          f"firing={sr_info['init_hidden_firing_rate']:.4f}")
+          f"hidden_firing={sr_info['init_hidden_firing_rate']:.4f}")
+    # For bptt we must train THROUGH the spiking output, so the output neurons
+    # have to spike at init (else surrogate gradients vanish). Ridge overwrites
+    # W_out with the closed-form solve, so it needs no output-firing sanity.
+    out_fire_info = {}
+    if args.mode == "fullbptt":
+        out_fire_info = output_firing_sanity(
+            model, X_tr[:sane_n].to(device), args.firing_low, args.firing_high)
+        print(f"[sanity] output W_out x{out_fire_info['w_out_scale']:.3f} -> "
+              f"output_firing={out_fire_info['output_firing_rate']:.4f}")
 
     wandb_run = init_wandb(args, manifest, nb_inputs, dt_ms, alpha, beta, sr_info)
 
@@ -645,6 +691,7 @@ def main() -> int:
         "continual_test_acc_before_incremental": new_before,
         "train_seconds": train_seconds,
         **{f"init_{k}": v for k, v in sr_info.items()},
+        **{f"init_{k}": v for k, v in out_fire_info.items()},
     }
     print(f"=== {args.mode} ===  train19={train_acc:.4f} val19={val_acc:.4f} "
           f"test19={test_acc:.4f} test20={test_acc_full20:.4f} "
@@ -741,6 +788,13 @@ def parse_args():
     p.add_argument("--tau-mem-ms", type=float, default=10.0)
     p.add_argument("--tau-syn-ms", type=float, default=5.0)
     p.add_argument("--threshold", type=float, default=1.0)
+    # spiking output layer (mean-rate decode). Long output taus so the output
+    # integrates over the trial; threshold/gain tuned so spiking eval tracks the
+    # linear readout (validated on ridge: spiking acc ~= linear acc).
+    p.add_argument("--output-tau-mem-ms", type=float, default=700.0)
+    p.add_argument("--output-tau-syn-ms", type=float, default=270.0)
+    p.add_argument("--output-threshold", type=float, default=5.0)
+    p.add_argument("--output-gain", type=float, default=1.0)
     p.add_argument("--weight-scale", type=float, default=0.2)
     p.add_argument("--surrogate-slope", type=float, default=100.0)
     p.add_argument("--init-spectral-radius", type=float, default=1.0)
@@ -755,7 +809,8 @@ def parse_args():
     p.add_argument("--grad-clip", type=float, default=0.0)
     p.add_argument("--limit", type=int, default=0, help="Use first N of each split")
     # runtime / logging
-    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--device", type=str, default="auto",
+                   choices=["auto", "cpu", "cuda", "mps"])
     p.add_argument("--wandb-mode", type=str, default="disabled",
                    choices=["online", "offline", "disabled"])
     p.add_argument("--wandb-project", type=str, default="shd-snn-pretrain")

@@ -65,23 +65,33 @@ NUM_CLASSES = C.NUM_CLASSES
 
 
 # =============================================================================
-# Feature-space helpers
+# Evaluation through the spiking output layer
 # =============================================================================
+#
+# RLS still TRAINS W_out on the linear hidden feature Phi=mean_t(hidden spikes)
+# (closed-form), but ACCURACY is measured by running the candidate W_out through
+# the spiking output neurons and decoding the highest mean-spike class -- exactly
+# like ridge/bptt. The frozen reservoir means the hidden trace is fixed, so we
+# extract it once per eval split and only re-run the cheap output layer per W.
 
 
-def feat_logits(Phi: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
-    """``Phi [N,H] @ W [H,20] -> [N,20]`` in float64 (matches RLS algebra)."""
-    return Phi.to(torch.float64) @ W.to(torch.float64)
+@torch.no_grad()
+def spiking_predict(model, trace: torch.Tensor, W: torch.Tensor,
+                    batch_size: int = 256) -> np.ndarray:
+    """Run the spiking output layer over a hidden trace with read-out ``W``.
 
-
-def feat_predict(Phi: torch.Tensor, W: torch.Tensor) -> np.ndarray:
-    if Phi.shape[0] == 0:
+    ``trace`` is ``[N,T,H]`` (frozen reservoir output); returns argmax of the
+    mean output-spike rate -> int64 ``[N]``.
+    """
+    if trace.shape[0] == 0:
         return np.zeros((0,), dtype=np.int64)
-    return feat_logits(Phi, W).argmax(1).cpu().numpy().astype(np.int64)
-
-
-def feat_accuracy(Phi: torch.Tensor, y: np.ndarray, W: torch.Tensor) -> float:
-    return C.accuracy(y, feat_predict(Phi, W))
+    dev = model.W_out.device
+    Wd = W.to(dev)
+    preds = []
+    for s in range(0, trace.shape[0], batch_size):
+        Psi = model.output_rates_from_trace(trace[s:s + batch_size].to(dev), W_out=Wd)
+        preds.append(Psi.argmax(1).cpu())
+    return torch.cat(preds, 0).numpy().astype(np.int64)
 
 
 # =============================================================================
@@ -137,32 +147,37 @@ def build_stream(Phi_new: torch.Tensor, y_new: np.ndarray,
 # =============================================================================
 
 
-def run_one(W_pre: torch.Tensor, *, Phi_old_test, y_old_test, Phi_new_test,
-            y_new_test, Phi_replay_pool, y_replay_pool, Phi_new_train, y_new_train,
+def run_one(model, W_pre: torch.Tensor, *, trace_comb, y_comb_test, n_old,
+            Phi_replay_pool, y_replay_pool, Phi_new_train, y_new_train,
             ratio: float, mode: str, delta: float, lam: float,
             rng: np.random.Generator) -> dict:
-    """Reset W from the pretrained read-out, run RLS over the stream, score."""
-    Phi_comb_test = torch.cat([Phi_old_test, Phi_new_test], dim=0)
-    y_comb_test = np.concatenate([y_old_test, y_new_test]).astype(np.int64)
+    """Reset W from the pretrained read-out, run RLS over the stream, score.
+
+    Evaluation runs the candidate read-out through the SPIKING output layer over
+    the (frozen) combined-test hidden trace; old/new are slices of the combined
+    predictions. RLS itself trains on the linear hidden feature Phi.
+    """
+    y_old_test, y_new_test = y_comb_test[:n_old], y_comb_test[n_old:]
+
+    def score(W):
+        pred = spiking_predict(model, trace_comb, W)
+        return (C.accuracy(y_old_test, pred[:n_old]),
+                C.accuracy(y_new_test, pred[n_old:]),
+                C.accuracy(y_comb_test, pred),
+                C.per_class_accuracy(y_comb_test, pred))
 
     # ---- evaluate BEFORE incremental learning ----
-    old_before = feat_accuracy(Phi_old_test, y_old_test, W_pre)
-    new_before = feat_accuracy(Phi_new_test, y_new_test, W_pre)
-    total_before = feat_accuracy(Phi_comb_test, y_comb_test, W_pre)
-    pc_before = C.per_class_accuracy(y_comb_test, feat_predict(Phi_comb_test, W_pre))
+    old_before, new_before, total_before, pc_before = score(W_pre)
 
-    # ---- build stream + RLS (only W_out changes) ----
+    # ---- build stream + RLS (only W_out changes; trained on linear Phi) ----
     Phi_stream, y_stream, n_new, n_replay = build_stream(
         Phi_new_train, y_new_train, Phi_replay_pool, y_replay_pool, ratio, mode, rng)
     rls = C.RLS(W_pre.clone(), delta=delta, lambda_forgetting=lam)
     rls.run_stream(Phi_stream, C.one_hot(y_stream))
     W_post = rls.W  # float64 [H, 20]
 
-    # ---- evaluate AFTER ----
-    old_after = feat_accuracy(Phi_old_test, y_old_test, W_post)
-    new_after = feat_accuracy(Phi_new_test, y_new_test, W_post)
-    total_after = feat_accuracy(Phi_comb_test, y_comb_test, W_post)
-    pc_after = C.per_class_accuracy(y_comb_test, feat_predict(Phi_comb_test, W_post))
+    # ---- evaluate AFTER (through the spiking output) ----
+    old_after, new_after, total_after, pc_after = score(W_post)
 
     return {
         "n_new": int(n_new), "n_replay": int(n_replay),
@@ -226,15 +241,23 @@ def main() -> int:
         C.write_json(os.path.join(args.output_dir, "inherited_preprocessing_manifest.json"),
                      manifest)
 
-    # ---- features (extracted once; reservoir is frozen) ----
-    Phi_old_test, y_old_test = load_split_features(
-        model, dataset_dir, "pretrain_test", args.batch_size, device, args.limit)
-    Phi_new_test, y_new_test = load_split_features(
-        model, dataset_dir, "continual_test", args.batch_size, device, args.limit)
+    # ---- features for RLS training (mean hidden spikes, extracted once) ----
     Phi_replay_pool, y_replay_pool = load_split_features(
         model, dataset_dir, args.replay_source, args.batch_size, device, args.limit)
     Phi_new_train, y_new_train = load_split_features(
         model, dataset_dir, args.new_class_source, args.batch_size, device, args.limit)
+
+    # ---- hidden TRACES for evaluation through the spiking output (once) ----
+    Xo, yo, _ = C.load_npz_split(os.path.join(dataset_dir, "pretrain_test.npz"), args.limit)
+    Xn, yn, _ = C.load_npz_split(os.path.join(dataset_dir, "continual_test.npz"), args.limit)
+    y_old_test = yo.numpy().astype(np.int64)
+    y_new_test = yn.numpy().astype(np.int64)
+    trace_old = C.collect_traces(model, Xo, args.batch_size, device)
+    trace_new = C.collect_traces(model, Xn, args.batch_size, device)
+    trace_comb = torch.cat([trace_old, trace_new], dim=0)        # [N_old+N_new, T, H]
+    y_comb_test = np.concatenate([y_old_test, y_new_test]).astype(np.int64)
+    n_old = len(y_old_test)
+    del trace_old, trace_new
 
     # ---- assertions (data/model contracts) ----
     # Channel count is also re-checked inside hidden_spikes during feature
@@ -285,12 +308,12 @@ def main() -> int:
             for si, seed in enumerate(seeds):
                 rng = np.random.default_rng(np.random.SeedSequence([args.seed, ri, si]))
                 res = run_one(
-                    W_pre, Phi_old_test=Phi_old_test, y_old_test=y_old_test,
-                    Phi_new_test=Phi_new_test, y_new_test=y_new_test,
-                    Phi_replay_pool=Phi_replay_pool, y_replay_pool=y_replay_pool,
-                    Phi_new_train=Phi_new_train, y_new_train=y_new_train,
-                    ratio=float(ratio), mode=args.replay_ratio_mode,
-                    delta=args.rls_delta, lam=args.rls_forgetting_factor, rng=rng)
+                    model, W_pre, trace_comb=trace_comb, y_comb_test=y_comb_test,
+                    n_old=n_old, Phi_replay_pool=Phi_replay_pool,
+                    y_replay_pool=y_replay_pool, Phi_new_train=Phi_new_train,
+                    y_new_train=y_new_train, ratio=float(ratio),
+                    mode=args.replay_ratio_mode, delta=args.rls_delta,
+                    lam=args.rls_forgetting_factor, rng=rng)
 
                 base = {
                     "ratio": float(ratio), "ratio_percent": float(ratio * 100.0),
@@ -427,7 +450,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-seeds", type=int, default=1,
                    help="Independent repeats per ratio (seeds = seed..seed+n-1)")
-    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--device", type=str, default="auto",
+                   choices=["auto", "cpu", "cuda", "mps"])
     p.add_argument("--replay-runs", type=int, default=11,
                    help="Number of replay-ratio points (linspace start..end)")
     p.add_argument("--replay-start-percent", type=float, default=0.0)

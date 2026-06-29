@@ -42,19 +42,123 @@ NUM_CLASSES = 20  # SHD: spoken digits 0-9 in English + German
 
 
 # =============================================================================
+# Spiking-output reservoir SNN
+# =============================================================================
+#
+# The whole-network classifier the pipeline uses. It is the SAME reservoir as
+# ``ReservoirSNN`` (W_in -> recurrent hidden LIF -> hidden spikes -> W_out), with
+# an added layer of ``nb_outputs`` *spiking* LIF neurons. The PREDICTION /
+# EVALUATION is always: feed input through the full network up to the output
+# spiking neurons and pick the class with the highest mean-over-time output
+# spike rate.  This is identical for ridge, RLS and bptt -- they differ only in
+# how ``W_out`` is obtained (ridge/RLS *generate* it by closed form on the linear
+# hidden-feature surrogate; bptt *trains* it through the spiking output).
+#
+# Parameters (W_in, W_rec, W_out) are exactly those of ``ReservoirSNN`` so all
+# checkpoints stay state-dict compatible. The output neurons reuse the hidden
+# LIF constants (alpha, beta, threshold); ``output_gain`` scales the current into
+# the output layer so the neurons spike in a useful range without changing W_out.
+
+
+class SpikingReadoutReservoirSNN(ReservoirSNN):
+    """ReservoirSNN + a spiking LIF output layer; decode by mean output rate."""
+
+    def __init__(self, *args, output_gain: float = 1.0,
+                 output_threshold: Optional[float] = None,
+                 output_alpha: Optional[float] = None,
+                 output_beta: Optional[float] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Output-layer knobs (NOT trained parameters): gain on the drive, the
+        # output-neuron threshold, and the output LIF decays. Crucially the
+        # output neurons use LONG time constants (output_alpha/beta near 1) so the
+        # membrane integrates over the whole trial -- the mean output-spike rate
+        # then tracks the time-averaged drive (Phi @ W_out), i.e. the same signal
+        # ridge/RLS optimize. With the short hidden decays the output would leak
+        # too fast and respond to noisy instantaneous drive instead. All set once
+        # at build time and saved in the checkpoint.
+        self.output_gain = float(output_gain)
+        self.output_threshold = (float(output_threshold)
+                                 if output_threshold is not None else self.threshold)
+        self.output_alpha = float(output_alpha) if output_alpha is not None else self.alpha
+        self.output_beta = float(output_beta) if output_beta is not None else self.beta
+
+    # -- core output-layer dynamics (second-order LIF, no recurrence) ---------
+    def _run_output_lif(self, drive: torch.Tensor) -> torch.Tensor:
+        """drive [B,T,O] output currents -> mean-over-time output spikes [B,O]."""
+        B, T, O = drive.shape
+        syn = torch.zeros(B, O, device=drive.device, dtype=drive.dtype)
+        mem = torch.zeros_like(syn)
+        spk_sum = torch.zeros_like(syn)
+        for t in range(T):
+            spk = self.spike_fn(mem - self.output_threshold)  # spike from membrane (step start)
+            rst = spk.detach()
+            new_syn = self.output_alpha * syn + drive[:, t]
+            mem = (self.output_beta * mem + syn) * (1.0 - rst)  # integrate, reset-to-zero
+            syn = new_syn
+            spk_sum = spk_sum + spk
+        return spk_sum / T
+
+    def output_rates_from_trace(self, trace: torch.Tensor,
+                                W_out: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Run only the output layer over a precomputed hidden trace ``[B,T,H]``.
+
+        ``W_out`` overrides ``self.W_out`` (used by RLS to score a candidate
+        read-out without touching the model). Returns mean output spikes ``[B,O]``.
+        """
+        W = self.W_out if W_out is None else W_out.to(trace.dtype)
+        B, T, H = trace.shape
+        drive = (trace.reshape(B * T, H) @ W).reshape(B, T, self.nb_outputs)
+        drive = drive * self.output_gain
+        return self._run_output_lif(drive)
+
+    def output_rates(self, x: torch.Tensor, return_phi: bool = False):
+        """Full forward: input -> reservoir -> spiking output -> mean rates [B,O].
+
+        Reuses the EXACT hidden dynamics via ``hidden_spikes(return_trace=True)``
+        so the reservoir is bit-identical to ridge/RLS feature extraction.
+        """
+        Phi, trace = self.hidden_spikes(x, return_trace=True)
+        Psi = self.output_rates_from_trace(trace)
+        return (Psi, Phi) if return_phi else Psi
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Prediction signal = mean-over-time output spike rates [B, nb_outputs]."""
+        return self.output_rates(x)
+
+
+# =============================================================================
 # Runtime: device + determinism
 # =============================================================================
 
 
+def _mps_available() -> bool:
+    return bool(getattr(torch.backends, "mps", None)
+                and torch.backends.mps.is_available())
+
+
 def resolve_device(choice: str) -> torch.device:
-    """Mirror of ``train_snn_shd.resolve_device`` (auto/cpu/cuda)."""
+    """Resolve auto/cpu/cuda/mps. ``auto`` prefers cuda, then mps, then cpu.
+
+    Note: the closed-form ridge solve and the RLS algebra deliberately run in
+    float64 on the CPU (MPS has no float64); only the SNN forward/backward uses
+    the accelerator, so MPS is safe here.
+    """
     if choice == "cpu":
         return torch.device("cpu")
     if choice == "cuda":
         if not torch.cuda.is_available():
             raise SystemExit("--device cuda requested but CUDA is not available")
         return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if choice == "mps":
+        if not _mps_available():
+            raise SystemExit("--device mps requested but MPS is not available")
+        return torch.device("mps")
+    # auto
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if _mps_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def set_determinism(seed: int) -> None:
@@ -258,9 +362,32 @@ def collect_features(model: ReservoirSNN, X: torch.Tensor, batch_size: int,
 
 
 @torch.no_grad()
+def collect_traces(model: ReservoirSNN, X: torch.Tensor, batch_size: int,
+                   device: torch.device) -> torch.Tensor:
+    """Per-timestep hidden spikes for every sample -> ``[N, T, H]`` (on CPU).
+
+    Used by the class-incremental script to score a candidate read-out through
+    the spiking output layer without re-running the (frozen) reservoir each time.
+    """
+    model.eval()
+    traces = []
+    for s in range(0, X.shape[0], batch_size):
+        xb = X[s:s + batch_size].to(device)
+        _, trace = model.hidden_spikes(xb, return_trace=True)
+        traces.append(trace.cpu())
+    if not traces:
+        return torch.zeros((0, X.shape[1], model.nb_hidden))
+    return torch.cat(traces, 0)
+
+
+@torch.no_grad()
 def predict(model: ReservoirSNN, X: torch.Tensor, batch_size: int,
             device: torch.device) -> np.ndarray:
-    """20-way ``argmax(logits)`` predictions over a split -> int64 ``[N]``."""
+    """20-way ``argmax`` predictions over a split -> int64 ``[N]``.
+
+    Uses ``model(x)`` which, for ``SpikingReadoutReservoirSNN``, is the mean
+    output-spike rate (the whole-network spiking readout).
+    """
     model.eval()
     preds = []
     for s in range(0, X.shape[0], batch_size):
@@ -317,7 +444,7 @@ def build_checkpoint(model: ReservoirSNN, *, dt_ms: float, tau_mem_ms: float,
     """Assemble the self-describing checkpoint dict (Stage 1 -> Stage 2 contract)."""
     return {
         "model_state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-        "model_class": "ReservoirSNN",
+        "model_class": type(model).__name__,
         "architecture": {
             "nb_inputs": int(model.nb_inputs),
             "nb_hidden": int(model.nb_hidden),
@@ -330,6 +457,11 @@ def build_checkpoint(model: ReservoirSNN, *, dt_ms: float, tau_mem_ms: float,
             "weight_scale": float(weight_scale),
             "surrogate_slope": float(surrogate_slope),
             "dt_ms": float(dt_ms),
+            # spiking output-layer params (None for a plain linear ReservoirSNN)
+            "output_gain": getattr(model, "output_gain", None),
+            "output_threshold": getattr(model, "output_threshold", None),
+            "output_alpha": getattr(model, "output_alpha", None),
+            "output_beta": getattr(model, "output_beta", None),
         },
         "active_classes": [int(c) for c in active_classes],
         "removed_class": int(removed_class),
@@ -341,20 +473,29 @@ def build_checkpoint(model: ReservoirSNN, *, dt_ms: float, tau_mem_ms: float,
     }
 
 
-def load_checkpoint_model(ckpt: dict, device: torch.device) -> ReservoirSNN:
-    """Rebuild a ``ReservoirSNN`` from a checkpoint and load its weights exactly.
+def load_checkpoint_model(ckpt: dict, device: torch.device
+                          ) -> "SpikingReadoutReservoirSNN":
+    """Rebuild the spiking-output reservoir SNN from a checkpoint, weights exact.
 
-    Crucially this loads the *trained* (or frozen-but-rescaled) reservoir, never
-    a fresh random one -- so fullbptt's learned W_in/W_rec and ridge's rescaled
-    random W_in/W_rec are both reproduced bit-for-bit.
+    Loads the *trained* (or frozen-but-rescaled) reservoir, never a fresh random
+    one. The output-layer params (gain/threshold/alpha/beta) are restored from
+    the checkpoint; missing values (older linear-only checkpoints) fall back to
+    the hidden-layer defaults.
     """
     a = ckpt["architecture"]
-    model = ReservoirSNN(
+    model = SpikingReadoutReservoirSNN(
         nb_inputs=int(a["nb_inputs"]), nb_hidden=int(a["nb_hidden"]),
         nb_outputs=int(a["nb_outputs"]), alpha=float(a["alpha"]),
         beta=float(a["beta"]), threshold=float(a["threshold"]),
         weight_scale=float(a["weight_scale"]),
         surrogate_slope=float(a["surrogate_slope"]),
+        output_gain=float(a["output_gain"]) if a.get("output_gain") is not None else 1.0,
+        output_threshold=(float(a["output_threshold"])
+                          if a.get("output_threshold") is not None else None),
+        output_alpha=(float(a["output_alpha"])
+                      if a.get("output_alpha") is not None else None),
+        output_beta=(float(a["output_beta"])
+                     if a.get("output_beta") is not None else None),
     ).to(device)
     state = {k: v.to(device) for k, v in ckpt["model_state_dict"].items()}
     model.load_state_dict(state)

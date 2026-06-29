@@ -209,6 +209,29 @@ def test_rls_update():
             pass
 
 
+def test_spiking_output_layer():
+    B, T, Cin, H = 4, 12, 35, 30
+    m = C.SpikingReadoutReservoirSNN(
+        Cin, H, 20, alpha=0.37, beta=0.61, threshold=1.0, weight_scale=0.6,
+        surrogate_slope=100.0, output_gain=1.0, output_threshold=2.0,
+        output_alpha=0.95, output_beta=0.98)
+    x = (torch.rand(B, T, Cin) > 0.5).float()
+    Psi = m.output_rates(x)
+    assert tuple(Psi.shape) == (B, 20)                  # mean output spikes [B,20]
+    assert float(Psi.min()) >= 0.0 and float(Psi.max()) <= 1.0  # rates in [0,1]
+    assert tuple(m(x).shape) == (B, 20)                 # forward == output rates
+    # output_rates_from_trace must match output_rates (same dynamics, reused trace)
+    _, trace = m.hidden_spikes(x, return_trace=True)
+    Psi2 = m.output_rates_from_trace(trace)
+    assert torch.allclose(Psi, Psi2, atol=1e-6)
+    # a zeroed read-out column produces ZERO output rate (the minimum) -> it can
+    # never spuriously win the argmax (this removes the CE zero-column artifact).
+    with torch.no_grad():
+        m.W_out[:, 10] = 0.0
+    Psi3 = m.output_rates(x)
+    assert float(Psi3[:, 10].abs().sum()) == 0.0
+
+
 def test_per_class_accuracy_null():
     y_true = np.array([0, 0, 1, 3, 3])     # class 2 absent
     y_pred = np.array([0, 1, 1, 3, 0])
