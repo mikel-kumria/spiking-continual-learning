@@ -11,17 +11,17 @@ run folder that Stage 2 (``class_incremental_snn_shd.py``) consumes:
        and saved on its own in the continual splits;
      * optional merge of the official train/test sets before re-splitting;
      * channel-axis-only compression (700 -> ``--n-compressed-channels``);
-     * label-stratified train/val/test splits for both partitions;
+     * label-stratified train/test splits (80/20) for both partitions;
      * leakage / binary / shape (anti-transpose) sanity checks before writing;
      * canonical ``.npz`` splits (``X uint8 [N,T,C]``, ``y int64 [N]``,
        ``speaker int64 [N]``) + a ``preprocessing_manifest.json``.
 
 2. PRETRAIN the recurrent SNN from ``train_snn_shd.py`` (single recurrent hidden
-   layer, ``Phi = mean_t(hidden_spikes)``, ``logits = Phi @ W_out``, no bias) on
-   the 19 active old classes only:
-     * ``fullbptt`` : train W_in + W_rec + W_out; cross-entropy computed over the
-       19 ACTIVE classes (logits masked, labels remapped to [0,18] only inside
-       the loss -- the saved labels stay original [0,19]).
+   layer, IF output neurons, ``Phi = mean_t(hidden_spikes)``) on the 19 active
+   old classes only:
+     * ``fullbptt`` : train W_in + W_rec + W_out through the IF output layer;
+       cross-entropy over the 19 ACTIVE classes; checkpoint = weights at the LAST
+       epoch (no validation split).
      * ``ridge``    : freeze W_in/W_rec; closed-form solve of W_out on the active
        old-class targets from the mean-spike feature.
    The removed-class output column is initialised DETERMINISTICALLY to zero (so
@@ -35,20 +35,21 @@ Output folder (``--output-root/--run-name``)::
       config.json
       preprocessing_manifest.json
       metrics.json
-      dataset/{pretrain,continual}_{train,val,test}.npz
-      checkpoints/{pretrained_model.pt,best_pretrained_model.pt}
+      dataset/{pretrain,continual}_{train,test}.npz
+      checkpoints/pretrained_model.pt
       logs/
 
 Example::
 
-    python pretrain_snn_shd.py \
-      --train-h5 data/SHD_raw/shd_train.h5 \
-      --test-h5  data/SHD_raw/shd_test.h5 \
-      --output-root outputs/shd_pretraining \
-      --run-name rc10_dt14_or70_removed10_ridge \
-      --removed-class 10 --dataset-binning-ms 14 \
-      --n-compressed-channels 70 --channel-compression-method or_pool \
+    python pretrain_snn_shd.py \\
+      --output-root outputs/shd_pretraining \\
+      --run-name rc10_dt14_or70_removed10_ridge \\
+      --removed-class 10 --dataset-binning-ms 14 \\
+      --n-compressed-channels 70 --channel-compression-method or_pool \\
       --mode ridge --nb-hidden 1000 --batch-size 64 --wandb-mode disabled
+
+    # Raw HDF5 defaults to ../../data/SHD_RAW/shd_{train,test}.h5 (override with
+    # --train-h5 / --test-h5 if needed).
 """
 from __future__ import annotations
 
@@ -70,6 +71,12 @@ import train_snn_shd as T  # reuse spectral_radius_sanity (exact same logic)
 
 NUM_CLASSES = C.NUM_CLASSES
 DEFAULT_NB_INPUTS = 700  # native SHD cochlea channel count
+
+
+def _default_shd_h5(filename: str) -> str:
+    """Default path to raw SHD HDF5 under ``research/data/SHD_RAW``."""
+    root = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(os.path.join(root, "..", "..", "data", "SHD_RAW", filename))
 
 
 # =============================================================================
@@ -230,26 +237,25 @@ def materialise(pool: EventPool, indices: np.ndarray, *, nb_steps: int,
 
 
 # =============================================================================
-# Label-stratified three-way split (sample-level, deterministic)
+# Label-stratified two-way split (sample-level, deterministic)
 # =============================================================================
 
 
-def validate_fractions(train_frac: float, val_frac: float, test_frac: float) -> None:
-    for name, v in (("train", train_frac), ("val", val_frac), ("test", test_frac)):
+def validate_two_fractions(train_frac: float, test_frac: float) -> None:
+    for name, v in (("train", train_frac), ("test", test_frac)):
         if not 0.0 <= v <= 1.0:
             raise ValueError(f"{name}_fraction={v} must be in [0, 1]")
-    total = train_frac + val_frac + test_frac
+    total = train_frac + test_frac
     if abs(total - 1.0) > 1e-6:
         raise ValueError(f"fractions must sum to 1.0 (got {total:.6f})")
 
 
-def stratified_three_way(labels: np.ndarray, *, train_frac: float, val_frac: float,
-                         test_frac: float, rng: np.random.Generator
-                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-class proportional split; every present class keeps >= 1 train sample."""
-    validate_fractions(train_frac, val_frac, test_frac)
+def stratified_two_way(labels: np.ndarray, *, train_frac: float, test_frac: float,
+                       rng: np.random.Generator
+                       ) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-class proportional train/test split; every present class keeps >= 1 train."""
+    validate_two_fractions(train_frac, test_frac)
     train_idx: List[int] = []
-    val_idx: List[int] = []
     test_idx: List[int] = []
     by_class: Dict[int, List[int]] = defaultdict(list)
     for i, l in enumerate(labels.tolist()):
@@ -258,27 +264,16 @@ def stratified_three_way(labels: np.ndarray, *, train_frac: float, val_frac: flo
         idxs = np.array(by_class[cls], dtype=np.int64)
         rng.shuffle(idxs)
         n = len(idxs)
-        n_val = int(round(n * val_frac))
         n_test = int(round(n * test_frac))
-        if val_frac > 0 and n_val == 0 and n >= 2:
-            n_val = 1
-        if test_frac > 0 and n_test == 0 and n >= 3:
+        if test_frac > 0 and n_test == 0 and n >= 2:
             n_test = 1
-        n_train = n - n_val - n_test
+        n_train = n - n_test
         if n_train < 1:
             n_train = 1
-            over = (n_val + n_test) - (n - 1)
-            while over > 0 and n_test > 0:
-                n_test -= 1
-                over -= 1
-            while over > 0 and n_val > 0:
-                n_val -= 1
-                over -= 1
+            n_test = n - 1
         train_idx.extend(idxs[:n_train].tolist())
-        val_idx.extend(idxs[n_train:n_train + n_val].tolist())
-        test_idx.extend(idxs[n_train + n_val:].tolist())
-    return (np.array(train_idx, np.int64), np.array(val_idx, np.int64),
-            np.array(test_idx, np.int64))
+        test_idx.extend(idxs[n_train:].tolist())
+    return np.array(train_idx, np.int64), np.array(test_idx, np.int64)
 
 
 # =============================================================================
@@ -287,13 +282,11 @@ def stratified_three_way(labels: np.ndarray, *, train_frac: float, val_frac: flo
 
 
 def run_preprocessing(args, dataset_dir: str) -> dict:
-    """Build + save the six ``.npz`` splits and the manifest. Returns the manifest."""
+    """Build + save the four ``.npz`` splits and the manifest. Returns the manifest."""
     if not 0 <= args.removed_class < NUM_CLASSES:
         raise ValueError(f"removed-class must be in [0, {NUM_CLASSES})")
-    validate_fractions(args.pretrain_train_fraction, args.pretrain_val_fraction,
-                       args.pretrain_test_fraction)
-    validate_fractions(args.continual_train_fraction, args.continual_val_fraction,
-                       args.continual_test_fraction)
+    validate_two_fractions(args.pretrain_train_fraction, args.pretrain_test_fraction)
+    validate_two_fractions(args.continual_train_fraction, args.continual_test_fraction)
     factor = C.validate_compression_factor(args.nb_inputs, args.n_compressed_channels)
     if args.channel_compression_method not in C.COMPRESSION_METHODS:
         raise ValueError(f"unknown channel-compression-method "
@@ -341,19 +334,17 @@ def run_preprocessing(args, dataset_dir: str) -> dict:
     con_X, con_y, con_spk = materialise(pool, con_idx, **mat_kw)
 
     # ---- stratified splits (indices local to each materialised partition) ----
-    pre_tr, pre_va, pre_te = stratified_three_way(
+    pre_tr, pre_te = stratified_two_way(
         pre_y, train_frac=args.pretrain_train_fraction,
-        val_frac=args.pretrain_val_fraction, test_frac=args.pretrain_test_fraction, rng=rng)
-    con_tr, con_va, con_te = stratified_three_way(
+        test_frac=args.pretrain_test_fraction, rng=rng)
+    con_tr, con_te = stratified_two_way(
         con_y, train_frac=args.continual_train_fraction,
-        val_frac=args.continual_val_fraction, test_frac=args.continual_test_fraction, rng=rng)
+        test_frac=args.continual_test_fraction, rng=rng)
 
     splits = {
         "pretrain_train": (pre_X, pre_y, pre_spk, pre_tr),
-        "pretrain_val": (pre_X, pre_y, pre_spk, pre_va),
         "pretrain_test": (pre_X, pre_y, pre_spk, pre_te),
         "continual_train": (con_X, con_y, con_spk, con_tr),
-        "continual_val": (con_X, con_y, con_spk, con_va),
         "continual_test": (con_X, con_y, con_spk, con_te),
     }
 
@@ -399,10 +390,8 @@ def run_preprocessing(args, dataset_dir: str) -> dict:
                     if (merged and args.test_h5) else None),
         "fractions": {
             "pretrain_train": args.pretrain_train_fraction,
-            "pretrain_val": args.pretrain_val_fraction,
             "pretrain_test": args.pretrain_test_fraction,
             "continual_train": args.continual_train_fraction,
-            "continual_val": args.continual_val_fraction,
             "continual_test": args.continual_test_fraction,
         },
         "splits": {**{f"{k}_n": v for k, v in counts.items()},
@@ -468,6 +457,44 @@ def evaluate_active(model, X, y, active_idx, batch_size, device) -> float:
     return correct / max(total, 1)
 
 
+@torch.no_grad()
+def _linear_logits(model, X, batch_size, device) -> torch.Tensor:
+    """Linear readout logits Phi @ W_out (Phi = mean_t hidden spikes); [N, O] on CPU.
+
+    This is the read-out the ridge solve actually fits -- it BYPASSES the IF
+    output layer entirely (no spiking decode), so it reflects the closed-form
+    readout's true separability rather than the (uncalibrated) spike-rate decode.
+    """
+    model.eval()
+    outs = []
+    for s in range(0, X.shape[0], batch_size):
+        Phi, _ = model.hidden_spikes(X[s:s + batch_size].to(device))  # [B, H]
+        outs.append((Phi @ model.W_out).cpu())
+    if not outs:
+        return torch.zeros((0, model.nb_outputs))
+    return torch.cat(outs, 0)
+
+
+@torch.no_grad()
+def evaluate_active_linear(model, X, y, active_idx, batch_size, device) -> float:
+    """19-way accuracy via the LINEAR Phi @ W_out readout (no IF output layer)."""
+    if X.shape[0] == 0:
+        return float("nan")
+    logits = _linear_logits(model, X, batch_size, device)
+    aidx = active_idx.cpu()
+    pred = aidx[logits.index_select(1, aidx).argmax(1)]
+    return float((pred == y.cpu()).float().mean().item())
+
+
+@torch.no_grad()
+def evaluate_split_linear(model, X, y, batch_size, device) -> float:
+    """20-way accuracy via the LINEAR Phi @ W_out readout (no IF output layer)."""
+    if X.shape[0] == 0:
+        return float("nan")
+    logits = _linear_logits(model, X, batch_size, device)
+    return float((logits.argmax(1) == y.cpu()).float().mean().item())
+
+
 def _zero_removed_column(model, removed_class: int) -> None:
     with torch.no_grad():
         model.W_out[:, removed_class] = 0.0
@@ -523,9 +550,12 @@ def train_ridge_active(model, X_tr, y_tr, active_classes, removed_class,
     _zero_removed_column(model, removed_class)  # explicit + deterministic
 
 
-def train_bptt_active(model, X_tr, y_tr, X_va, y_va, active_classes, removed_class,
-                      args, device, wandb_run) -> dict:
-    """fullbptt over all weights; cross-entropy on the 19 ACTIVE classes only."""
+def train_bptt_active(model, X_tr, y_tr, active_classes, removed_class,
+                      args, device, wandb_run) -> None:
+    """fullbptt over all weights; cross-entropy on the 19 ACTIVE classes only.
+
+    Runs ``nb_epochs`` and leaves the model at the LAST epoch (no validation split).
+    """
     model.requires_grad_(True)
     params = [p for p in model.parameters() if p.requires_grad]
     lr = args.lr if args.lr > 0 else 2e-4
@@ -544,7 +574,6 @@ def train_bptt_active(model, X_tr, y_tr, X_va, y_va, active_classes, removed_cla
     gen = torch.Generator().manual_seed(args.seed)
     N = X_tr.shape[0]
     nb_steps = X_tr.shape[1]
-    best = {"val_acc": -1.0, "epoch": -1, "state": None}
     for epoch in range(args.nb_epochs):
         model.train()
         t0 = time.time()
@@ -555,9 +584,6 @@ def train_bptt_active(model, X_tr, y_tr, X_va, y_va, active_classes, removed_cla
             xb = X_tr[idx].to(device)
             yb = y_tr[idx].to(device)
             yk = pos[yb]                                    # remapped [0,18]
-            # Train THROUGH the spiking output: CE on the output spike COUNT
-            # (mean rate * nb_steps) so logits are well-scaled and the surrogate
-            # gradient accumulates over time. Mask to the 19 active classes.
             counts = model(xb) * nb_steps                   # [B, nb_outputs]
             logits = counts.index_select(1, active_idx)     # [B, 19]
             loss = loss_fn(logits, yk)
@@ -572,20 +598,12 @@ def train_bptt_active(model, X_tr, y_tr, X_va, y_va, active_classes, removed_cla
             seen += n
         train_loss = run_loss / max(seen, 1)
         train_acc = run_correct / max(seen, 1)
-        val_acc = evaluate_active(model, X_va, y_va, active_idx, args.batch_size, device)
-        if val_acc > best["val_acc"]:
-            best = {"val_acc": val_acc, "epoch": epoch,
-                    "state": {k: v.detach().cpu().clone()
-                              for k, v in model.state_dict().items()}}
         if wandb_run is not None:
             wandb_run.log({"epoch": epoch, "train_loss": train_loss,
-                           "train_acc_active": train_acc, "val_acc_active": val_acc,
-                           "best_val_acc_active": best["val_acc"], "lr": lr,
+                           "train_acc_active": train_acc, "lr": lr,
                            "epoch_seconds": time.time() - t0})
         print(f"[fullbptt] epoch={epoch:03d} loss={train_loss:.4f} "
-              f"train_acc={train_acc:.4f} val_acc={val_acc:.4f} "
-              f"best={best['val_acc']:.4f}@{best['epoch']} ({time.time()-t0:.1f}s)")
-    return best
+              f"train_acc={train_acc:.4f} ({time.time()-t0:.1f}s)")
 
 
 # =============================================================================
@@ -613,7 +631,6 @@ def main() -> int:
 
     # ---- reload the saved splits (validates the npz round-trip) ----
     X_tr, y_tr, _ = C.load_npz_split(os.path.join(dataset_dir, "pretrain_train.npz"), args.limit)
-    X_va, y_va, _ = C.load_npz_split(os.path.join(dataset_dir, "pretrain_val.npz"), args.limit)
     X_te, y_te, _ = C.load_npz_split(os.path.join(dataset_dir, "pretrain_test.npz"), args.limit)
     Xc_te, yc_te, _ = C.load_npz_split(os.path.join(dataset_dir, "continual_test.npz"), args.limit)
     nb_inputs = X_tr.shape[2]
@@ -626,20 +643,16 @@ def main() -> int:
     # ---- neuron decays from the dataset binning dt ----
     dt_ms = float(args.dataset_binning_ms)
     alpha, beta = C.derive_alpha_beta(dt_ms, args.tau_mem_ms, args.tau_syn_ms)
-    # The SPIKING output neurons use long time constants so their mean-spike rate
-    # integrates over the trial and tracks the time-averaged drive (the same
-    # signal ridge/RLS optimise); short hidden decays would leak too fast.
-    out_alpha, out_beta = C.derive_alpha_beta(dt_ms, args.output_tau_mem_ms,
-                                              args.output_tau_syn_ms)
     print(f"dt_ms={dt_ms} hidden alpha={alpha:.4f} beta={beta:.4f} | "
-          f"output alpha={out_alpha:.4f} beta={out_beta:.4f} thr={args.output_threshold}")
+          f"output=IF (alpha={C.OUTPUT_IF_ALPHA} beta={C.OUTPUT_IF_BETA}) "
+          f"thr={args.output_threshold} gain={args.output_gain}")
 
     # ---- model + spectral-radius sanity (reuse train_snn_shd's exact logic) ----
     model = C.SpikingReadoutReservoirSNN(
         nb_inputs, args.nb_hidden, args.nb_outputs, alpha, beta, args.threshold,
         args.weight_scale, args.surrogate_slope, output_gain=args.output_gain,
-        output_threshold=args.output_threshold, output_alpha=out_alpha,
-        output_beta=out_beta).to(device)
+        output_threshold=args.output_threshold,
+        output_alpha=C.OUTPUT_IF_ALPHA, output_beta=C.OUTPUT_IF_BETA).to(device)
     sr_ns = SimpleNamespace(
         init_spectral_radius=args.init_spectral_radius, firing_low=args.firing_low,
         firing_high=args.firing_high, sr_scale_up=1.2, sr_scale_down=0.8, sr_max_iters=20)
@@ -662,40 +675,47 @@ def main() -> int:
     # ---- Stage 1b: pretrain on the 19 active classes ----
     active_idx_dev = torch.tensor(active_classes, dtype=torch.long, device=device)
     t0 = time.time()
-    best_state = None
     if args.mode == "ridge":
         train_ridge_active(model, X_tr, y_tr, active_classes, args.removed_class,
                            args.ridge_lambda, args.batch_size, device)
-    else:  # fullbptt
-        best = train_bptt_active(model, X_tr, y_tr, X_va, y_va, active_classes,
-                                 args.removed_class, args, device, wandb_run)
-        if best["state"] is not None:
-            model.load_state_dict({k: v.to(device) for k, v in best["state"].items()})
-        _zero_removed_column(model, args.removed_class)  # deterministic removed col
-        best_state = best["state"]
+    else:  # fullbptt: last-epoch weights kept in model
+        train_bptt_active(model, X_tr, y_tr, active_classes,
+                          args.removed_class, args, device, wandb_run)
+        _zero_removed_column(model, args.removed_class)
     train_seconds = time.time() - t0
 
     # ---- metrics (19-way active accuracy is the meaningful pretraining metric) ----
     train_acc = evaluate_active(model, X_tr, y_tr, active_idx_dev, args.batch_size, device)
-    val_acc = evaluate_active(model, X_va, y_va, active_idx_dev, args.batch_size, device)
     test_acc = evaluate_active(model, X_te, y_te, active_idx_dev, args.batch_size, device)
     test_acc_full20, _ = C.evaluate_split(model, X_te, y_te, args.batch_size, device)
     # new-class accuracy BEFORE incremental learning -- expected ~0 (zero column).
     new_before, _ = C.evaluate_split(model, Xc_te, yc_te, args.batch_size, device)
+    # LINEAR Phi @ W_out readout (bypasses the IF output layer) -- the read-out
+    # ridge actually fits; for ridge this is the meaningful, IF-decode-free metric.
+    train_acc_lin = evaluate_active_linear(model, X_tr, y_tr, active_idx_dev, args.batch_size, device)
+    test_acc_lin = evaluate_active_linear(model, X_te, y_te, active_idx_dev, args.batch_size, device)
+    test_acc_full20_lin = evaluate_split_linear(model, X_te, y_te, args.batch_size, device)
+    new_before_lin = evaluate_split_linear(model, Xc_te, yc_te, args.batch_size, device)
     pretraining_metrics = {
         "mode": args.mode,
         "pretrain_train_acc_active19": train_acc,
-        "pretrain_val_acc_active19": val_acc,
         "pretrain_test_acc_active19": test_acc,
         "pretrain_test_acc_full20": test_acc_full20,
         "continual_test_acc_before_incremental": new_before,
+        "pretrain_train_acc_active19_linear": train_acc_lin,
+        "pretrain_test_acc_active19_linear": test_acc_lin,
+        "pretrain_test_acc_full20_linear": test_acc_full20_lin,
+        "continual_test_acc_before_incremental_linear": new_before_lin,
         "train_seconds": train_seconds,
         **{f"init_{k}": v for k, v in sr_info.items()},
         **{f"init_{k}": v for k, v in out_fire_info.items()},
     }
-    print(f"=== {args.mode} ===  train19={train_acc:.4f} val19={val_acc:.4f} "
+    print(f"=== {args.mode} ===  train19={train_acc:.4f} "
           f"test19={test_acc:.4f} test20={test_acc_full20:.4f} "
           f"continual_test(before)={new_before:.4f}")
+    print(f"    [linear Phi@W_out] train19={train_acc_lin:.4f} "
+          f"test19={test_acc_lin:.4f} test20={test_acc_full20_lin:.4f} "
+          f"continual_test(before)={new_before_lin:.4f}")
 
     # ---- save checkpoints + config + metrics ----
     config = {k: (v if not isinstance(v, np.generic) else v.item())
@@ -708,20 +728,19 @@ def main() -> int:
         pretraining_metrics=pretraining_metrics, dataset_dir=os.path.abspath(dataset_dir),
         config=config, removed_class_init_policy="zero")
     torch.save(ckpt, os.path.join(ckpt_dir, "pretrained_model.pt"))
-    # best checkpoint: for fullbptt the best-val state (removed col already zeroed
-    # on the loaded model); for ridge the closed-form solution == final.
-    best_ckpt = dict(ckpt)
-    if best_state is not None:
-        bs = {k: v.clone() for k, v in best_state.items()}
-        bs["W_out"][:, args.removed_class] = 0.0
-        best_ckpt["model_state_dict"] = bs
-    torch.save(best_ckpt, os.path.join(ckpt_dir, "best_pretrained_model.pt"))
 
     C.write_json(os.path.join(run_dir, "config.json"), config)
     C.write_json(os.path.join(run_dir, "metrics.json"), pretraining_metrics)
     print(f"Saved run to {os.path.abspath(run_dir)}")
 
     if wandb_run is not None:
+        # Log scalar metrics as HISTORY (not just summary) so they render as
+        # wandb panels. Ridge does no per-epoch logging, so without this it has
+        # no plottable accuracy at all; for fullbptt this adds the final-eval
+        # accuracies alongside the per-epoch train curves.
+        loggable = {k: v for k, v in pretraining_metrics.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        wandb_run.log(loggable)
         for k, v in pretraining_metrics.items():
             wandb_run.summary[k] = v
         wandb_run.finish()
@@ -754,8 +773,10 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     # data / preprocessing
-    p.add_argument("--train-h5", type=str, default=None, help="Path to shd_train.h5")
-    p.add_argument("--test-h5", type=str, default=None, help="Path to shd_test.h5")
+    p.add_argument("--train-h5", type=str, default=_default_shd_h5("shd_train.h5"),
+                   help="Path to shd_train.h5 (ignored in synthetic mode)")
+    p.add_argument("--test-h5", type=str, default=_default_shd_h5("shd_test.h5"),
+                   help="Path to shd_test.h5 (ignored in synthetic mode)")
     p.add_argument("--output-root", type=str, default="outputs/shd_pretraining")
     p.add_argument("--run-name", type=str, required=True)
     p.add_argument("--removed-class", type=int, required=True, help="Held-out class 0-19")
@@ -772,12 +793,10 @@ def parse_args():
                    help="Threshold for or_pool/conditional_or (group fires if >= this)")
     p.add_argument("--merge-train-test", action=argparse.BooleanOptionalAction, default=True,
                    help="Merge official train+test before re-splitting")
-    p.add_argument("--pretrain-train-fraction", type=float, default=0.70)
-    p.add_argument("--pretrain-val-fraction", type=float, default=0.15)
-    p.add_argument("--pretrain-test-fraction", type=float, default=0.15)
-    p.add_argument("--continual-train-fraction", type=float, default=0.70)
-    p.add_argument("--continual-val-fraction", type=float, default=0.15)
-    p.add_argument("--continual-test-fraction", type=float, default=0.15)
+    p.add_argument("--pretrain-train-fraction", type=float, default=0.80)
+    p.add_argument("--pretrain-test-fraction", type=float, default=0.20)
+    p.add_argument("--continual-train-fraction", type=float, default=0.80)
+    p.add_argument("--continual-test-fraction", type=float, default=0.20)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--synthetic-samples-per-class", type=int, default=0,
                    help="If >0, skip HDF5 and fabricate a tiny pool (smoke tests)")
@@ -788,12 +807,8 @@ def parse_args():
     p.add_argument("--tau-mem-ms", type=float, default=10.0)
     p.add_argument("--tau-syn-ms", type=float, default=5.0)
     p.add_argument("--threshold", type=float, default=1.0)
-    # spiking output layer (mean-rate decode). Long output taus so the output
-    # integrates over the trial; threshold/gain tuned so spiking eval tracks the
-    # linear readout (validated on ridge: spiking acc ~= linear acc).
-    p.add_argument("--output-tau-mem-ms", type=float, default=700.0)
-    p.add_argument("--output-tau-syn-ms", type=float, default=270.0)
-    p.add_argument("--output-threshold", type=float, default=5.0)
+    # IF output layer (tau_syn=0, no membrane leak); gain/threshold tune firing range.
+    p.add_argument("--output-threshold", type=float, default=1.0)
     p.add_argument("--output-gain", type=float, default=1.0)
     p.add_argument("--weight-scale", type=float, default=0.2)
     p.add_argument("--surrogate-slope", type=float, default=100.0)

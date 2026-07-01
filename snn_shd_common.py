@@ -47,54 +47,55 @@ NUM_CLASSES = 20  # SHD: spoken digits 0-9 in English + German
 #
 # The whole-network classifier the pipeline uses. It is the SAME reservoir as
 # ``ReservoirSNN`` (W_in -> recurrent hidden LIF -> hidden spikes -> W_out), with
-# an added layer of ``nb_outputs`` *spiking* LIF neurons. The PREDICTION /
-# EVALUATION is always: feed input through the full network up to the output
-# spiking neurons and pick the class with the highest mean-over-time output
-# spike rate.  This is identical for ridge, RLS and bptt -- they differ only in
-# how ``W_out`` is obtained (ridge/RLS *generate* it by closed form on the linear
+# an added layer of ``nb_outputs`` integrate-and-fire (IF) neurons. The PREDICTION
+# / EVALUATION is always: feed input through the full network up to the output
+# spiking neurons and pick the class with the highest mean-over-time output spike
+# rate.  This is identical for ridge, RLS and bptt -- they differ only in how
+# ``W_out`` is obtained (ridge/RLS *generate* it by closed form on the linear
 # hidden-feature surrogate; bptt *trains* it through the spiking output).
 #
-# Parameters (W_in, W_rec, W_out) are exactly those of ``ReservoirSNN`` so all
-# checkpoints stay state-dict compatible. The output neurons reuse the hidden
-# LIF constants (alpha, beta, threshold); ``output_gain`` scales the current into
-# the output layer so the neurons spike in a useful range without changing W_out.
+# Output neurons are IF with no synaptic filter (tau_syn=0) and no membrane leak
+# (tau_mem=inf), so the spike-rate decode tracks the linear readout ``Phi @ W_out``
+# in the unsaturated regime. ``output_gain`` scales the drive into the output layer.
+
+
+# IF output layer: synaptic state bypassed (alpha=0), no membrane leak (beta=1).
+OUTPUT_IF_ALPHA = 0.0
+OUTPUT_IF_BETA = 1.0
 
 
 class SpikingReadoutReservoirSNN(ReservoirSNN):
-    """ReservoirSNN + a spiking LIF output layer; decode by mean output rate."""
+    """ReservoirSNN + IF output layer; decode by mean output spike rate."""
 
     def __init__(self, *args, output_gain: float = 1.0,
                  output_threshold: Optional[float] = None,
                  output_alpha: Optional[float] = None,
                  output_beta: Optional[float] = None, **kwargs):
         super().__init__(*args, **kwargs)
-        # Output-layer knobs (NOT trained parameters): gain on the drive, the
-        # output-neuron threshold, and the output LIF decays. Crucially the
-        # output neurons use LONG time constants (output_alpha/beta near 1) so the
-        # membrane integrates over the whole trial -- the mean output-spike rate
-        # then tracks the time-averaged drive (Phi @ W_out), i.e. the same signal
-        # ridge/RLS optimize. With the short hidden decays the output would leak
-        # too fast and respond to noisy instantaneous drive instead. All set once
-        # at build time and saved in the checkpoint.
         self.output_gain = float(output_gain)
         self.output_threshold = (float(output_threshold)
                                  if output_threshold is not None else self.threshold)
-        self.output_alpha = float(output_alpha) if output_alpha is not None else self.alpha
-        self.output_beta = float(output_beta) if output_beta is not None else self.beta
+        # Stored for checkpoint provenance; IF dynamics ignore decay (alpha=0, beta=1).
+        self.output_alpha = float(output_alpha if output_alpha is not None
+                                  else OUTPUT_IF_ALPHA)
+        self.output_beta = float(output_beta if output_beta is not None
+                                 else OUTPUT_IF_BETA)
 
-    # -- core output-layer dynamics (second-order LIF, no recurrence) ---------
-    def _run_output_lif(self, drive: torch.Tensor) -> torch.Tensor:
-        """drive [B,T,O] output currents -> mean-over-time output spikes [B,O]."""
+    # -- core output-layer dynamics (integrate-and-fire, no recurrence) -------
+    def _run_output_if(self, drive: torch.Tensor) -> torch.Tensor:
+        """drive [B,T,O] currents -> mean-over-time output spikes [B,O].
+
+        Integrate-and-fire: each step adds ``drive[:, t]`` directly to the
+        membrane (tau_syn=0), with no leak (tau_mem=inf). Spike at step start,
+        hard reset-to-zero on fire.
+        """
         B, T, O = drive.shape
-        syn = torch.zeros(B, O, device=drive.device, dtype=drive.dtype)
-        mem = torch.zeros_like(syn)
-        spk_sum = torch.zeros_like(syn)
+        mem = torch.zeros(B, O, device=drive.device, dtype=drive.dtype)
+        spk_sum = torch.zeros_like(mem)
         for t in range(T):
-            spk = self.spike_fn(mem - self.output_threshold)  # spike from membrane (step start)
+            spk = self.spike_fn(mem - self.output_threshold)
             rst = spk.detach()
-            new_syn = self.output_alpha * syn + drive[:, t]
-            mem = (self.output_beta * mem + syn) * (1.0 - rst)  # integrate, reset-to-zero
-            syn = new_syn
+            mem = (mem + drive[:, t]) * (1.0 - rst)
             spk_sum = spk_sum + spk
         return spk_sum / T
 
@@ -109,7 +110,7 @@ class SpikingReadoutReservoirSNN(ReservoirSNN):
         B, T, H = trace.shape
         drive = (trace.reshape(B * T, H) @ W).reshape(B, T, self.nb_outputs)
         drive = drive * self.output_gain
-        return self._run_output_lif(drive)
+        return self._run_output_if(drive)
 
     def output_rates(self, x: torch.Tensor, return_phi: bool = False):
         """Full forward: input -> reservoir -> spiking output -> mean rates [B,O].
@@ -264,8 +265,8 @@ def assert_compression_invariants(x_in: np.ndarray, x_out: np.ndarray,
 # =============================================================================
 
 SPLIT_NAMES = (
-    "pretrain_train", "pretrain_val", "pretrain_test",
-    "continual_train", "continual_val", "continual_test",
+    "pretrain_train", "pretrain_test",
+    "continual_train", "continual_test",
 )
 
 
@@ -462,6 +463,7 @@ def build_checkpoint(model: ReservoirSNN, *, dt_ms: float, tau_mem_ms: float,
             "output_threshold": getattr(model, "output_threshold", None),
             "output_alpha": getattr(model, "output_alpha", None),
             "output_beta": getattr(model, "output_beta", None),
+            "output_layer": "if",
         },
         "active_classes": [int(c) for c in active_classes],
         "removed_class": int(removed_class),

@@ -15,6 +15,11 @@ ONCE per split and run the whole sweep in feature space (``logits = Phi @ W``),
 which is exact and fast. "Reload the pretrained checkpoint fresh" for each
 (ratio, seed) therefore means: reset ``W = pretrained W_out`` and ``P = I/delta``.
 
+RLS uses the same linear hidden feature as ridge pretraining (``Phi``) and the
+same IF output-layer decode for accuracy. The ridge and fullbptt ``W_pre`` may
+differ in magnitude (bptt trains through the spiking output); no rescaling is
+applied -- each checkpoint's ``W_pre`` is used as-is.
+
 Replay (rehearsal, NOT rehearsal-free)
 --------------------------------------
 Replay uses RAW old-class samples (their frozen features) mixed into the new
@@ -147,7 +152,7 @@ def build_stream(Phi_new: torch.Tensor, y_new: np.ndarray,
 # =============================================================================
 
 
-def run_one(model, W_pre: torch.Tensor, *, trace_comb, y_comb_test, n_old,
+def run_one(model, W_pre: torch.Tensor, *, trace_comb, Phi_comb, y_comb_test, n_old,
             Phi_replay_pool, y_replay_pool, Phi_new_train, y_new_train,
             ratio: float, mode: str, delta: float, lam: float,
             rng: np.random.Generator) -> dict:
@@ -166,8 +171,19 @@ def run_one(model, W_pre: torch.Tensor, *, trace_comb, y_comb_test, n_old,
                 C.accuracy(y_comb_test, pred),
                 C.per_class_accuracy(y_comb_test, pred))
 
+    def score_linear(W):
+        # LINEAR readout: argmax(Phi @ W) over all 20 classes -- bypasses the IF
+        # output layer (Phi = mean_t hidden spikes), the exact feature RLS trains
+        # on. This is the IF-decode-free accuracy requested for ridge/RLS.
+        logits = Phi_comb @ W.to(Phi_comb.dtype)
+        pred = logits.argmax(1).cpu().numpy().astype(np.int64)
+        return (C.accuracy(y_old_test, pred[:n_old]),
+                C.accuracy(y_new_test, pred[n_old:]),
+                C.accuracy(y_comb_test, pred))
+
     # ---- evaluate BEFORE incremental learning ----
     old_before, new_before, total_before, pc_before = score(W_pre)
+    lin_old_before, lin_new_before, lin_total_before = score_linear(W_pre)
 
     # ---- build stream + RLS (only W_out changes; trained on linear Phi) ----
     Phi_stream, y_stream, n_new, n_replay = build_stream(
@@ -178,6 +194,7 @@ def run_one(model, W_pre: torch.Tensor, *, trace_comb, y_comb_test, n_old,
 
     # ---- evaluate AFTER (through the spiking output) ----
     old_after, new_after, total_after, pc_after = score(W_post)
+    lin_old_after, lin_new_after, lin_total_after = score_linear(W_post)
 
     return {
         "n_new": int(n_new), "n_replay": int(n_replay),
@@ -188,6 +205,11 @@ def run_one(model, W_pre: torch.Tensor, *, trace_comb, y_comb_test, n_old,
         "forgetting_old": old_before - old_after,
         "old_acc_delta": old_after - old_before,
         "new_acc_delta": new_after - new_before,
+        # LINEAR Phi @ W readout (no IF output layer) -- old/new/total before+after
+        "old_acc_before_linear": lin_old_before, "old_acc_after_linear": lin_old_after,
+        "new_acc_before_linear": lin_new_before, "new_acc_after_linear": lin_new_after,
+        "total_acc_before_linear": lin_total_before, "total_acc_after_linear": lin_total_after,
+        "forgetting_old_linear": lin_old_before - lin_old_after,
         "per_class_acc_before": pc_before,
         "per_class_acc_after": pc_after,
         "W_post": W_post,
@@ -258,6 +280,8 @@ def main() -> int:
     y_comb_test = np.concatenate([y_old_test, y_new_test]).astype(np.int64)
     n_old = len(y_old_test)
     del trace_old, trace_new
+    # linear feature for the IF-decode-free readout: Phi = mean_t(hidden spikes).
+    Phi_comb = trace_comb.mean(dim=1).double()                   # [N_old+N_new, H]
 
     # ---- assertions (data/model contracts) ----
     # Channel count is also re-checked inside hidden_spikes during feature
@@ -298,6 +322,9 @@ def main() -> int:
         "old_acc_before", "old_acc_after", "new_acc_before", "new_acc_after",
         "total_acc_before", "total_acc_after",
         "forgetting_old", "old_acc_delta", "new_acc_delta",
+        "old_acc_before_linear", "old_acc_after_linear",
+        "new_acc_before_linear", "new_acc_after_linear",
+        "total_acc_before_linear", "total_acc_after_linear", "forgetting_old_linear",
     ] + [f"pc_after_{c:02d}" for c in range(NUM_CLASSES)]
 
     rows: List[dict] = []
@@ -308,7 +335,8 @@ def main() -> int:
             for si, seed in enumerate(seeds):
                 rng = np.random.default_rng(np.random.SeedSequence([args.seed, ri, si]))
                 res = run_one(
-                    model, W_pre, trace_comb=trace_comb, y_comb_test=y_comb_test,
+                    model, W_pre, trace_comb=trace_comb, Phi_comb=Phi_comb,
+                    y_comb_test=y_comb_test,
                     n_old=n_old, Phi_replay_pool=Phi_replay_pool,
                     y_replay_pool=y_replay_pool, Phi_new_train=Phi_new_train,
                     y_new_train=y_new_train, ratio=float(ratio),
@@ -344,7 +372,18 @@ def main() -> int:
                 _save_final_checkpoint(ckpt_out_dir, ckpt, model, res["W_post"],
                                        ratio, seed, args)
                 if wandb_run is not None:
-                    wandb_run.log({"ratio": float(ratio), "seed": int(seed), **scalar})
+                    # per-class accuracy (skip classes absent from the eval set ->
+                    # None) so the full old-19 + new-class breakdown is on wandb too.
+                    pc_log = {}
+                    for c in range(NUM_CLASSES):
+                        va = res["per_class_acc_after"][c]
+                        vb = res["per_class_acc_before"][c]
+                        if va is not None:
+                            pc_log[f"per_class_acc_after/class_{c:02d}"] = va
+                        if vb is not None:
+                            pc_log[f"per_class_acc_before/class_{c:02d}"] = vb
+                    wandb_run.log({"ratio": float(ratio), "seed": int(seed),
+                                   **scalar, **pc_log})
                 print(f"r={ratio:5.2f} seed={seed} | old {res['old_acc_before']:.3f}"
                       f"->{res['old_acc_after']:.3f} new {res['new_acc_before']:.3f}"
                       f"->{res['new_acc_after']:.3f} tot {res['total_acc_before']:.3f}"
@@ -390,7 +429,10 @@ def _save_final_checkpoint(ckpt_out_dir, base_ckpt, model, W_post, ratio, seed, 
 def _summarize(rows: List[dict], ratios, args) -> dict:
     metrics = ["old_acc_after", "new_acc_after", "total_acc_after",
                "forgetting_old", "old_acc_delta", "new_acc_delta",
-               "old_acc_before", "new_acc_before", "total_acc_before"]
+               "old_acc_before", "new_acc_before", "total_acc_before",
+               "old_acc_after_linear", "new_acc_after_linear", "total_acc_after_linear",
+               "old_acc_before_linear", "new_acc_before_linear", "total_acc_before_linear",
+               "forgetting_old_linear"]
     per_ratio = []
     for ri, ratio in enumerate(ratios):
         sel = [r for r in rows if r["ratio_index"] == ri]
@@ -459,7 +501,7 @@ def parse_args():
     p.add_argument("--replay-ratio-mode", type=str, default="additive",
                    choices=["additive", "fixed_budget"])
     p.add_argument("--replay-source", type=str, default="pretrain_train",
-                   choices=["pretrain_train", "pretrain_val", "pretrain_test"])
+                   choices=["pretrain_train", "pretrain_test"])
     p.add_argument("--new-class-source", type=str, default="continual_train",
                    choices=["continual_train"])
     p.add_argument("--eval-splits", type=str, nargs="+",

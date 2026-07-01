@@ -117,10 +117,10 @@ def test_split_leakage():
     pre_dir, _ = _run_pipeline()
     dd = os.path.join(pre_dir, "dataset")
     removed = _SYNTH["removed_class"]
-    for split in ("pretrain_train", "pretrain_val", "pretrain_test"):
+    for split in ("pretrain_train", "pretrain_test"):
         y = np.load(os.path.join(dd, f"{split}.npz"))["y"]
         assert removed not in set(y.tolist()), f"{split} leaks removed class"
-    for split in ("continual_train", "continual_val", "continual_test"):
+    for split in ("continual_train", "continual_test"):
         y = np.load(os.path.join(dd, f"{split}.npz"))["y"]
         assert set(y.tolist()) <= {removed}, f"{split} has non-removed classes"
     # labels stay original 0..19 (never permanently remapped)
@@ -213,8 +213,8 @@ def test_spiking_output_layer():
     B, T, Cin, H = 4, 12, 35, 30
     m = C.SpikingReadoutReservoirSNN(
         Cin, H, 20, alpha=0.37, beta=0.61, threshold=1.0, weight_scale=0.6,
-        surrogate_slope=100.0, output_gain=1.0, output_threshold=2.0,
-        output_alpha=0.95, output_beta=0.98)
+        surrogate_slope=100.0, output_gain=1.0, output_threshold=1.0,
+        output_alpha=C.OUTPUT_IF_ALPHA, output_beta=C.OUTPUT_IF_BETA)
     x = (torch.rand(B, T, Cin) > 0.5).float()
     Psi = m.output_rates(x)
     assert tuple(Psi.shape) == (B, 20)                  # mean output spikes [B,20]
@@ -250,7 +250,7 @@ def test_end_to_end_files_and_learning():
     pre_dir, cil_dir = _run_pipeline()
     # pretrain artifacts
     for rel in ("config.json", "preprocessing_manifest.json", "metrics.json",
-                "checkpoints/pretrained_model.pt", "checkpoints/best_pretrained_model.pt"):
+                "checkpoints/pretrained_model.pt"):
         assert os.path.isfile(os.path.join(pre_dir, rel)), rel
     for split in C.SPLIT_NAMES:
         assert os.path.isfile(os.path.join(pre_dir, "dataset", f"{split}.npz")), split
