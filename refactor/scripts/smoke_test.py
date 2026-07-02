@@ -58,7 +58,7 @@ def _small_model(manifest, output_layer_type="linear_integrator"):
     return build_model_from_manifest(
         manifest, nb_outputs=NUM_CLASSES, tau_mem_ms=10.0, tau_syn_ms=5.0,
         tau_out_mem_ms=20.0, threshold=1.0, weight_scale=2.0, surrogate_slope=100.0,
-        nb_hidden=64, output_layer_type=output_layer_type, output_gain=1.0,
+        nb_hidden=64, output_layer_type=output_layer_type,
         output_threshold=1.0, logit_source="spike_sum", leaky_readout="last_mem")
 
 

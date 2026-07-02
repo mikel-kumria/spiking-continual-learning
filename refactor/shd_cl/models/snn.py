@@ -9,7 +9,7 @@
 
 Feature contract for ridge / lastbptt: ``hidden_spike_sum = trace.sum(dim=1)``.
 For ``output_layer_type="linear_integrator"`` (the default readout), the output
-logits are EXACTLY ``hidden_spike_sum @ W_out * output_gain``, so ridge and BPTT
+logits are EXACTLY ``hidden_spike_sum @ W_out``, so ridge and BPTT
 are evaluated on equivalent logits. For leaky/lif output layers the output-layer
 decode differs from the linear readout; that is logged as a secondary diagnostic.
 """
@@ -45,7 +45,7 @@ class ReservoirSNN(nn.Module):
                  alpha: float, beta: float, threshold: float, weight_scale: float,
                  surrogate_slope: float,
                  output_layer_type: str = "linear_integrator",
-                 output_gain: float = 1.0, output_threshold: float = 1.0,
+                 output_threshold: float = 1.0,
                  beta_out: float = 1.0, logit_source: str = "spike_sum",
                  leaky_readout: str = "last_mem",
                  target_spectral_radius: float = 1.0,
@@ -55,7 +55,6 @@ class ReservoirSNN(nn.Module):
         self.nb_hidden = int(nb_hidden)
         self.nb_outputs = int(nb_outputs)
         self.output_layer_type = output_layer_type
-        self.output_gain = float(output_gain)
         self.output_threshold = float(output_threshold)
         self.beta_out = float(beta_out)
         self.logit_source = logit_source
@@ -111,11 +110,10 @@ class ReservoirSNN(nn.Module):
 
     def output_drive(self, trace: torch.Tensor,
                      W_out: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Per-timestep output drive ``[B,T,O] = (trace @ W_out) * output_gain``."""
+        """Per-timestep output drive ``[B,T,O] = trace @ W_out``."""
         W = self.W_out if W_out is None else W_out.to(trace.dtype)
         B, T, H = trace.shape
-        drive = (trace.reshape(B * T, H) @ W).reshape(B, T, self.nb_outputs)
-        return drive * self.output_gain
+        return (trace.reshape(B * T, H) @ W).reshape(B, T, self.nb_outputs)
 
     def logits_from_trace(self, trace: torch.Tensor,
                           W_out: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -128,12 +126,12 @@ class ReservoirSNN(nn.Module):
 
     def linear_logits_from_sum(self, spike_sum: torch.Tensor,
                                W_out: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """PRIMARY linear readout: ``(hidden_spike_sum @ W_out) * output_gain``.
+        """PRIMARY linear readout: ``hidden_spike_sum @ W_out``.
 
         This bypasses any nonlinear output layer and is the correct ridge readout.
         """
         W = self.W_out if W_out is None else W_out.to(spike_sum.dtype)
-        return (spike_sum @ W) * self.output_gain
+        return spike_sum @ W
 
 
 def build_model_from_manifest(manifest: dict, *, nb_outputs: int,
@@ -141,7 +139,7 @@ def build_model_from_manifest(manifest: dict, *, nb_outputs: int,
                               tau_out_mem_ms: float, threshold: float,
                               weight_scale: float, surrogate_slope: float,
                               nb_hidden: int, output_layer_type: str,
-                              output_gain: float, output_threshold: float,
+                              output_threshold: float,
                               logit_source: str, leaky_readout: str,
                               target_spectral_radius: float = 1.0,
                               seed_spectral: bool = True) -> ReservoirSNN:
@@ -157,7 +155,7 @@ def build_model_from_manifest(manifest: dict, *, nb_outputs: int,
     return ReservoirSNN(
         nb_inputs, nb_hidden, nb_outputs, alpha=alpha, beta=beta, threshold=threshold,
         weight_scale=weight_scale, surrogate_slope=surrogate_slope,
-        output_layer_type=output_layer_type, output_gain=output_gain,
+        output_layer_type=output_layer_type,
         output_threshold=output_threshold, beta_out=beta_out,
         logit_source=logit_source, leaky_readout=leaky_readout,
         target_spectral_radius=target_spectral_radius, seed_spectral=seed_spectral)

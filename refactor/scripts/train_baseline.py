@@ -38,7 +38,7 @@ OVERRIDABLE = [
     "run_name", "output_root", "dataset_binning_ms", "dataset_max_seconds",
     "n_compressed_channels", "channel_compression_method", "training_method",
     "ridge_lambda", "ridge_weighting", "nb_hidden", "nb_epochs", "batch_size", "lr",
-    "optimizer", "grad_clip", "output_layer_type", "output_gain", "output_threshold",
+    "optimizer", "grad_clip", "output_layer_type", "output_threshold",
     "logit_source", "leaky_readout", "device", "wandb_mode", "wandb_name", "limit",
     "seed",
 ]
@@ -86,7 +86,7 @@ def main() -> int:
         tau_syn_ms=float(cfg["tau_syn_ms"]), tau_out_mem_ms=float(cfg["tau_out_mem_ms"]),
         threshold=float(cfg["threshold"]), weight_scale=float(cfg["weight_scale"]),
         surrogate_slope=float(cfg["surrogate_slope"]), nb_hidden=int(cfg["nb_hidden"]),
-        output_layer_type=cfg["output_layer_type"], output_gain=float(cfg["output_gain"]),
+        output_layer_type=cfg["output_layer_type"],
         output_threshold=float(cfg["output_threshold"]), logit_source=cfg["logit_source"],
         leaky_readout=cfg["leaky_readout"],
         target_spectral_radius=float(cfg["target_spectral_radius"])).to(device)

@@ -39,7 +39,6 @@ weight_scale: 1.0                          # NB: 1.0 (not the reference's 0.2). 
 surrogate_slope: 100.0
 target_spectral_radius: 1.0               # one-time deterministic W_rec renormalisation
 output_layer_type: linear_integrator      # linear_integrator | leaky_integrator | lif_no_reset
-output_gain: 1.0
 output_threshold: 1.0
 logit_source: spike_sum                    # for lif_no_reset
 leaky_readout: last_mem                     # for leaky_integrator

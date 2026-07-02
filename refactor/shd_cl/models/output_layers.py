@@ -1,6 +1,6 @@
 """Configurable output layers. Each maps a per-timestep drive ``[B,T,O]`` to
-logits ``[B,O]``. The drive is always ``hidden_spikes_t @ W_out`` (times an
-optional ``output_gain``); the parent SNN owns ``W_out``, the output layer only
+logits ``[B,O]``. The drive is always ``hidden_spikes_t @ W_out``; the parent
+SNN owns ``W_out``, the output layer only
 implements the neuron dynamics. There is NO bias anywhere.
 
 Three types (spec §4):

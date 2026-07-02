@@ -86,7 +86,7 @@ def test_primary_linear_readout_matches_spike_sum_matmul():
     X = (torch.rand(6, 10, m.nb_inputs) < 0.3).float()
     trace = m.hidden_trace(X)
     spike_sum = trace.sum(dim=1)
-    manual = (spike_sum @ m.W_out) * m.output_gain
+    manual = spike_sum @ m.W_out
     via_helper = m.linear_logits_from_sum(spike_sum)
     via_forward = m(X)                                  # linear_integrator forward
     assert torch.allclose(manual, via_helper, atol=1e-5)

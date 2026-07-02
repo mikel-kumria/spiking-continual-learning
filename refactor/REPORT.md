@@ -107,12 +107,12 @@ A package `shd_cl` with single-responsibility modules and thin CLI wrappers:
 
 ## 5. The three output layers (`models/output_layers.py`)
 
-All receive a per-timestep drive `drive_t = (hidden_spikes_t @ W_out) *
-output_gain` and return logits `[B, O]`. No bias.
+All receive a per-timestep drive `drive_t = (hidden_spikes_t @ W_out)` and return
+logits `[B, O]`. No bias.
 
 - **`linear_integrator`** — pure accumulator, no leak/reset/spiking:
   `out_mem_t = out_mem_{t-1} + drive_t`, so `logits = out_mem_T = sum_t drive_t =
-  hidden_spike_sum @ W_out * output_gain`. This is the **primary, correct** readout
+  hidden_spike_sum @ W_out`. This is the **primary, correct** readout
   and exactly the target ridge fits. Verified in `tests/test_ridge_shapes.py`
   (`linear_integrator` forward == `spike_sum @ W_out`).
 - **`leaky_integrator`** — leaky accumulator, no spiking:
@@ -314,7 +314,7 @@ for the stability/plasticity tradeoff (consistent with the project memory findin
 8. **BPTT with spiking output layers can vanish at init.** `lif_no_reset` +
    `spike_sum` with a tiny init `W_out` starts near-silent (small surrogate
    gradient). No output-firing calibration is implemented (spec removed it); use
-   `linear_integrator` for BPTT, or raise `output_gain` / init scale.
+   `linear_integrator` for BPTT, or raise init scale.
 9. **BPTT GPU reproducibility not guaranteed** (`use_deterministic_algorithms` is
    not enabled). Preprocessing and ridge are deterministic.
 10. **Whole splits held in memory, manual batching.** Fine at SHD scale; no
