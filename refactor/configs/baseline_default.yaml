@@ -3,7 +3,7 @@
 
 # ---- experiment ----
 experiment_regime: baseline_20_class
-run_name: baseline_dt14_or70_ridge
+run_name: baseline_dt14_graded35_ridge
 output_root: outputs/refactor_baseline
 
 # ---- raw data ----
