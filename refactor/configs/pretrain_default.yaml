@@ -1,0 +1,64 @@
+# Default config for the class-incremental PRETRAINING regime (preprocess + pretrain).
+# Used by scripts/preprocess_shd.py and scripts/pretrain.py.
+# Flat mapping: scripts read by key; CLI flags override any value here.
+
+# ---- experiment ----
+experiment_regime: pretrain_19_class      # hold out `removed_class`
+run_name: rc10_dt14_or70_removed10_ridge
+output_root: outputs/refactor_pretraining
+
+# ---- raw data ----
+train_h5: datasets/SHD_raw/shd_train.h5
+test_h5: datasets/SHD_raw/shd_test.h5
+merge_train_test: true                    # NOTE: breaks official-benchmark comparability
+synthetic_samples_per_class: 0            # >0 fabricates a tiny pool (no HDF5 needed)
+
+# ---- preprocessing ----
+removed_class: 10
+dataset_binning_ms: 14.0
+dataset_max_seconds: 1.4
+nb_inputs: 700                            # native channels before compression
+n_compressed_channels: 70                 # must divide nb_inputs
+channel_compression_method: or_pool       # or_pool | conditional_or | graded | bernoulli
+condition_or: 1
+train_fraction: 0.80
+test_fraction: 0.20
+seed: 42
+
+# ---- model ----
+nb_hidden: 1000
+nb_outputs: 20
+tau_mem_ms: 10.0
+tau_syn_ms: 5.0
+tau_out_mem_ms: 20.0                       # only used by leaky_integrator / lif_no_reset
+threshold: 1.0
+weight_scale: 1.0                          # NB: 1.0 (not the reference's 0.2). With the
+                                           # firing-rate calibration loop removed (per spec),
+                                           # 0.2 leaves the reservoir SILENT; ~1.0 self-fires
+                                           # at ~3% on SHD. See REPORT.md 'Known limitations'.
+surrogate_slope: 100.0
+target_spectral_radius: 1.0               # one-time deterministic W_rec renormalisation
+output_layer_type: linear_integrator      # linear_integrator | leaky_integrator | lif_no_reset
+output_gain: 1.0
+output_threshold: 1.0
+logit_source: spike_sum                    # for lif_no_reset
+leaky_readout: last_mem                     # for leaky_integrator
+
+# ---- training ----
+training_method: ridge                     # ridge | fullbptt | lastbptt
+ridge_lambda: 1.0
+ridge_weighting: none                       # baseline/pretrain default is 'none'
+nb_epochs: 200
+batch_size: 64
+lr: 0.0                                     # <=0 -> per-method default
+optimizer: adamax
+grad_clip: 0.0
+limit: 0
+
+# ---- runtime / logging ----
+device: auto
+wandb_mode: disabled
+wandb_project: shd-refactor-pretrain
+wandb_entity: null
+wandb_name: null
+raster_max_neurons: 200

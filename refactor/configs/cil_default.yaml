@@ -1,0 +1,40 @@
+# Default config for the CLASS-INCREMENTAL replay sweep.
+# Used by scripts/cil_sweep.py, which loads a pretrained checkpoint produced by
+# scripts/pretrain.py and learns the removed class with per-old-class replay.
+
+# ---- source pretrained run ----
+pretrained_checkpoint: null                # REQUIRED (path to pretrained_model.pt)
+output_dir: outputs/refactor_class_incremental/rc10_ridge_sweep
+
+# ---- CIL method ----
+cil_training_method: ridge                 # ridge | lastbptt | fullbptt
+ridge_lambda: 1.0
+ridge_weighting: normalized_inverse_class_count   # CIL default (lambda comparable across ratios)
+
+# ---- replay (PER OLD CLASS) ----
+max_replay_percent: 100
+min_replay_percent: 0
+num_replays: 11                            # 100, 90, ..., 10, 0
+n_new_cap: 0                               # 0 -> use all new-class train samples
+replay_replacement_policy: with_replacement_if_needed  # | cap_at_available | error
+replay_source: pretrain_train              # old-class replay pool
+new_class_source: continual_train          # new-class train pool
+
+# ---- seeds ----
+seed: 0
+n_seeds: 3
+
+# ---- bptt (only for lastbptt / fullbptt CIL) ----
+nb_epochs: 100
+batch_size: 64
+lr: 0.0
+optimizer: adamax
+grad_clip: 0.0
+
+# ---- runtime / logging ----
+device: auto
+limit: 0
+wandb_mode: disabled
+wandb_project: shd-refactor-class-incremental
+wandb_entity: null
+wandb_name: null

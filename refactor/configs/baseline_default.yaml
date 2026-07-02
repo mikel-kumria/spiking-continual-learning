@@ -1,0 +1,63 @@
+# Default config for the BASELINE regime: train + test on all 20 classes.
+# Used by scripts/train_baseline.py (which preprocesses then trains in one shot).
+
+# ---- experiment ----
+experiment_regime: baseline_20_class
+run_name: baseline_dt14_or70_ridge
+output_root: outputs/refactor_baseline
+
+# ---- raw data ----
+train_h5: datasets/SHD_raw/shd_train.h5
+test_h5: datasets/SHD_raw/shd_test.h5
+merge_train_test: true
+synthetic_samples_per_class: 0
+
+# ---- preprocessing ----
+removed_class: null                        # unused in baseline
+dataset_binning_ms: 14.0
+dataset_max_seconds: 1.4
+nb_inputs: 700
+n_compressed_channels: 70
+channel_compression_method: or_pool
+condition_or: 1
+train_fraction: 0.80
+test_fraction: 0.20
+seed: 42
+
+# ---- model ----
+nb_hidden: 1000
+nb_outputs: 20
+tau_mem_ms: 10.0
+tau_syn_ms: 5.0
+tau_out_mem_ms: 20.0
+threshold: 1.0
+weight_scale: 1.0                          # NB: 1.0 (not the reference's 0.2). With the
+                                           # firing-rate calibration loop removed (per spec),
+                                           # 0.2 leaves the reservoir SILENT; ~1.0 self-fires
+                                           # at ~3% on SHD. See REPORT.md 'Known limitations'.
+surrogate_slope: 100.0
+target_spectral_radius: 1.0
+output_layer_type: linear_integrator
+output_gain: 1.0
+output_threshold: 1.0
+logit_source: spike_sum
+leaky_readout: last_mem
+
+# ---- training ----
+training_method: ridge
+ridge_lambda: 1.0
+ridge_weighting: none
+nb_epochs: 200
+batch_size: 64
+lr: 0.0
+optimizer: adamax
+grad_clip: 0.0
+limit: 0
+
+# ---- runtime / logging ----
+device: auto
+wandb_mode: disabled
+wandb_project: shd-refactor-baseline
+wandb_entity: null
+wandb_name: null
+raster_max_neurons: 200
