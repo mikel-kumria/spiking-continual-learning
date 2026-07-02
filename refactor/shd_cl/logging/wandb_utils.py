@@ -27,6 +27,17 @@ def log(run, payload: dict) -> None:
         run.log(payload)
 
 
+def define_metric(run, name: str, *, step_metric: Optional[str] = None) -> None:
+    """Register a custom x-axis for W&B line charts (``step_metric`` = x key)."""
+    if run is None:
+        return
+    import wandb
+    if step_metric is None:
+        wandb.define_metric(name)
+    else:
+        wandb.define_metric(name, step_metric=step_metric)
+
+
 def log_image(run, key: str, fig) -> None:
     """Log a matplotlib figure under ``key`` (no-op if run is None)."""
     if run is None:
@@ -47,3 +58,9 @@ def set_summary(run, metrics: dict) -> None:
 def finish(run) -> None:
     if run is not None:
         run.finish()
+
+
+def log_plotly(run, key: str, fig) -> None:
+    """Log a Plotly figure under ``key`` (no-op if run is None)."""
+    if run is not None:
+        run.log({key: fig})

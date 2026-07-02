@@ -3,7 +3,7 @@
 
 # ---- experiment ----
 experiment_regime: baseline_20_class
-run_name: baseline_dt14_graded35_ridge
+run_name: baseline_dt14_graded35_fullbptt       # fullbptt: baseline_dt14_graded35_fullbptt
 output_root: outputs/refactor_baseline
 
 # ---- raw data ----
@@ -16,9 +16,9 @@ synthetic_samples_per_class: 0
 removed_class: null                        # unused in baseline
 dataset_binning_ms: 14.0
 dataset_max_seconds: 0.7
-nb_inputs: 700
-n_compressed_channels: 35
-channel_compression_method: graded
+nb_inputs: 700                             # fullbptt: unchanged
+n_compressed_channels: 35                  # fullbptt: unchanged
+channel_compression_method: graded         # fullbptt: unchanged
 condition_or: 1
 train_fraction: 0.80
 test_fraction: 0.20
@@ -40,14 +40,14 @@ logit_source: spike_sum
 leaky_readout: last_mem
 
 # ---- training ----
-training_method: ridge
-ridge_lambda: 1.0
-ridge_weighting: none
-nb_epochs: 200
+training_method: fullbptt                     # ridge or fullbptt or lastbptt
+ridge_lambda: 1.0                          # unused for fullbptt
+ridge_weighting: none                      # unused for fullbptt
+nb_epochs: 200                             # fullbptt: keep 200
 batch_size: 64
-lr: 0.0
+lr: 2e-4                                    # fullbptt: 2e-4, lastbptt: 2e-3
 optimizer: adamax
-grad_clip: 0.0
+grad_clip: 0.0                             # fullbptt: optional, e.g. 1.0
 limit: 0
 
 # ---- runtime / logging ----
